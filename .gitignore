@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+*.egg-info/
+.venv/
+venv/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Numerical output
+*.npy
+*.npz
+*.h5
+*.hdf5
+results/
+plots/
+*.png
+*.pdf
+
+# But keep figures you actually want to commit
+!docs/figures/*.png
