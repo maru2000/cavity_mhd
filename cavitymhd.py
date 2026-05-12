@@ -179,6 +179,7 @@ class CavityFlow:
         self.Bx = np.full((N+2, N+1), B[0]) # x-component
         self.By = np.full((N+1, N+2), B[1]) # y-component
         self.Bz = np.full((N+1, N+1), B[2]) # z-component
+        self.phi = np.zeros((N+2, N+2)) # electric potential at cell centers
 
         self.u = np.zeros((N + 2, N + 1))
         self.v = np.zeros((N + 1, N + 2))
