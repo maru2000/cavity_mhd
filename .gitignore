@@ -26,6 +26,8 @@ results/
 plots/
 *.png
 *.pdf
+*.pptx
+*.md
 
 # But keep figures you actually want to commit
 !docs/figures/*.png
