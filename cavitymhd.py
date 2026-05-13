@@ -89,7 +89,7 @@ class FaceVector:
 # Solver class
 # ────────────────────────────────────────────────────────────────────
 
-class CavityFlow:
+class CavityMHD:
     """2D incompressible lid-driven cavity on a staggered grid.
 
     Layout (row 0 = top of physical domain):
@@ -142,7 +142,53 @@ class CavityFlow:
         dt_conv = min(self.dx / u_max, self.dy / v_max)
         dt_diff = 0.5 * min(self.dx, self.dy)**2 * self.Re
         return safety * min(dt_conv, dt_diff)
+    
+    # ── interior interpolations (used by convective term) ───────────
 
+    def _u_to_c(self, u):
+        N = self.N
+        return 0.5 * (u[1:N+1, 0:N] + u[1:N+1, 1:N+1])
+
+    def _v_to_c(self, v):
+        N = self.N
+        return 0.5 * (v[0:N, 1:N+1] + v[1:N+1, 1:N+1])
+
+    def _u_to_n(self, u):
+        N = self.N
+        return 0.5 * (u[0:N+1, :] + u[1:N+2, :])
+
+    def _v_to_n(self, v):
+        N = self.N
+        return 0.5 * (v[:, 0:N+1] + v[:, 1:N+2])
+    
+    # ── additional interpolations for cross product ─────────────────
+
+    def _v_to_u(self, v):
+        """v from v-faces to interior u-faces. (N+1, N+2) -> (N, N-1).
+        4-point average from the four v-faces surrounding each interior u-face."""
+        N = self.N
+        return 0.25 * (v[0:N,   1:N]   + v[0:N,   2:N+1]
+                    + v[1:N+1, 1:N]   + v[1:N+1, 2:N+1])
+
+    def _u_to_v(self, u):
+        """u from u-faces to interior v-faces. (N+2, N+1) -> (N-1, N).
+        4-point average from the four u-faces surrounding each interior v-face."""
+        N = self.N
+        return 0.25 * (u[1:N,   0:N]   + u[1:N,   1:N+1]
+                    + u[2:N+1, 0:N]   + u[2:N+1, 1:N+1])
+
+    def _n_to_u(self, c):
+        """Corner-stored scalar to interior u-faces. (N+1, N+1) -> (N, N-1).
+        2-point average from corners directly above and below each u-face."""
+        N = self.N
+        return 0.5 * (c[0:N,   1:N] + c[1:N+1, 1:N])
+
+    def _n_to_v(self, c):
+        """Corner-stored scalar to interior v-faces. (N+1, N+1) -> (N-1, N).
+        2-point average from corners directly left and right of each v-face."""
+        N = self.N
+        return 0.5 * (c[1:N, 0:N] + c[1:N, 1:N+1])
+        
     # ── operators ───────────────────────────────────────────────────
 
     def grad(self, field: CellScalar) -> FaceVector:
@@ -174,6 +220,45 @@ class CavityFlow:
                + (fy[0:N-1, 1:N+1] - 2*fy[1:N, 1:N+1] + fy[2:N+1, 1:N+1]) / (self.dy ** 2))
 
         return FaceVector(x_at_u=lap_x, y_at_v=lap_y)
+    
+    def cross(self, field1: FaceVector, field2: FaceVector) -> FaceVector:
+        """Cross product of two face-stored vector fields, field1 x field2.
+
+        Output lattices match the input convention:
+        x-component at INTERIOR u-faces, shape (N, N-1)
+        y-component at INTERIOR v-faces, shape (N-1, N)
+        z-component at all corners,      shape (N+1, N+1)
+
+        Note the asymmetry: in-plane outputs are interior-only (since they
+        feed compute_H, which writes to interior u/v faces), while the
+        z-component covers all corners (since corners have no ghost concept
+        and the z-component will feed jz which is used in the Lorentz force
+        via 2-point averages to interior faces).
+        """
+        a, b = field1, field2
+
+        # ── x-component at interior u-faces: a_y*b_z - a_z*b_y ──
+        ay_at_u = self._v_to_u(a.y_at_v)        # (N, N-1)
+        bz_at_u = self._n_to_u(b.z_at_n)        # (N, N-1)
+        az_at_u = self._n_to_u(a.z_at_n)        # (N, N-1)
+        by_at_u = self._v_to_u(b.y_at_v)        # (N, N-1)
+        out_x = ay_at_u * bz_at_u - az_at_u * by_at_u
+
+        # ── y-component at interior v-faces: a_z*b_x - a_x*b_z ──
+        az_at_v = self._n_to_v(a.z_at_n)        # (N-1, N)
+        bx_at_v = self._u_to_v(b.x_at_u)        # (N-1, N)
+        ax_at_v = self._u_to_v(a.x_at_u)        # (N-1, N)
+        bz_at_v = self._n_to_v(b.z_at_n)        # (N-1, N)
+        out_y = az_at_v * bx_at_v - ax_at_v * bz_at_v
+
+        # ── z-component at all corners: a_x*b_y - a_y*b_x ──
+        ax_at_n = self._u_to_n(a.x_at_u)        # (N+1, N+1)
+        by_at_n = self._v_to_n(b.y_at_v)        # (N+1, N+1)
+        ay_at_n = self._v_to_n(a.y_at_v)        # (N+1, N+1)
+        bx_at_n = self._u_to_n(b.x_at_u)        # (N+1, N+1)
+        out_z = ax_at_n * by_at_n - ay_at_n * bx_at_n
+
+        return FaceVector(x_at_u=out_x, y_at_v=out_y, z_at_n=out_z)
 
     # ── boundary conditions ─────────────────────────────────────────
 
@@ -201,40 +286,6 @@ class CavityFlow:
         p[:, 0]  = p[:, 1];   p[:, -1] = p[:, -2]
         p[0, :]  = p[1, :];   p[-1, :] = p[-2, :]
 
-    # ── interior interpolations (used by convective term) ───────────
-
-    def _u_to_c(self, u):
-        N = self.N
-        return 0.5 * (u[1:N+1, 0:N] + u[1:N+1, 1:N+1])
-
-    def _v_to_c(self, v):
-        N = self.N
-        return 0.5 * (v[0:N, 1:N+1] + v[1:N+1, 1:N+1])
-
-    def _u_to_n(self, u):
-        N = self.N
-        return 0.5 * (u[0:N+1, :] + u[1:N+2, :])
-
-    def _v_to_n(self, v):
-        N = self.N
-        return 0.5 * (v[:, 0:N+1] + v[:, 1:N+2])
-
-    # ── divergence and pressure gradients used by projection ────────
-
-    def _div_uv_to_c(self, u, v):
-        """Discrete divergence at interior cells. Used by project()."""
-        N = self.N
-        div_x = (u[1:N+1, 1:N+1] - u[1:N+1, 0:N]) / self.dx
-        div_y = (v[0:N, 1:N+1] - v[1:N+1, 1:N+1]) / self.dy
-        return div_x + div_y
-
-    def _grad_x_p_to_u(self, p):
-        N = self.N
-        return (p[1:N+1, 2:N+1] - p[1:N+1, 1:N]) / self.dx
-
-    def _grad_y_p_to_v(self, p):
-        N = self.N
-        return (p[1:N, 1:N+1] - p[2:N+1, 1:N+1]) / self.dy
 
     # ── physics: RHS of momentum (convective + viscous) ─────────────
 
@@ -272,6 +323,10 @@ class CavityFlow:
         """Bundle u, v into a FaceVector for operator use."""
         return FaceVector(x_at_u=self.u, y_at_v=self.v)
 
+    def pressure(self) -> CellScalar:
+        """Bundle p into a CellScalar for operator use."""
+        return CellScalar(data=self.p)
+
     # ── pressure projection ─────────────────────────────────────────
 
     def solve_pressure(self, source, alpha=1.7, tol=1e-7,
@@ -290,10 +345,10 @@ class CavityFlow:
 
     def project(self, dt):
         N = self.N
-        source = self._div_uv_to_c(self.u, self.v) / dt
+        source = self.div(self.velocity()).data / dt
         self.solve_pressure(source)
-        self.u[1:N+1, 1:N]   -= dt * self._grad_x_p_to_u(self.p)
-        self.v[1:N,   1:N+1] -= dt * self._grad_y_p_to_v(self.p)
+        self.u[1:N+1, 1:N]   -= dt * self.grad(self.pressure()).x_at_u[1:N+1, 1:N]
+        self.v[1:N,   1:N+1] -= dt * self.grad(self.pressure()).y_at_v[1:N, 1:N+1]
 
     # ── time stepping ───────────────────────────────────────────────
 
@@ -337,7 +392,7 @@ class CavityFlow:
                 du, dv = self.u - u_prev, self.v - v_prev
                 rms = np.sqrt((np.sum(du**2) + np.sum(dv**2))
                               / (du.size + dv.size)) / self.dt
-                div = np.max(np.abs(self._div_uv_to_c(self.u, self.v)))
+                div = np.max(np.abs(self.div(self.velocity()).data))
                 print(f"step {self.step_count:6d}  t={self.t:.3f}  "
                       f"rms_dudt={rms:.3e}  max|div|={div:.2e}")
                 if steady_tol is not None and rms < steady_tol:
@@ -381,6 +436,42 @@ class CavityFlow:
 
         print("All operator tests pass")
 
+        # cross product: cyclic basis tests
+        # e_x x e_y = e_z, e_y x e_z = e_x, e_z x e_x = e_y
+        ex = FaceVector(x_at_u=np.ones((N+2, N+1)),
+                        y_at_v=np.zeros((N+1, N+2)),
+                        z_at_n=np.zeros((N+1, N+1)))
+        ey = FaceVector(x_at_u=np.zeros((N+2, N+1)),
+                        y_at_v=np.ones((N+1, N+2)),
+                        z_at_n=np.zeros((N+1, N+1)))
+        ez = FaceVector(x_at_u=np.zeros((N+2, N+1)),
+                        y_at_v=np.zeros((N+1, N+2)),
+                        z_at_n=np.ones((N+1, N+1)))
+
+        c = self.cross(ex, ey)
+        assert np.allclose(c.x_at_u, 0), "ex x ey: x-component should be 0"
+        assert np.allclose(c.y_at_v, 0), "ex x ey: y-component should be 0"
+        assert np.allclose(c.z_at_n, 1), "ex x ey: z-component should be 1"
+
+        c = self.cross(ey, ez)
+        assert np.allclose(c.x_at_u, 1), "ey x ez: x-component should be 1"
+        assert np.allclose(c.y_at_v, 0), "ey x ez: y-component should be 0"
+        assert np.allclose(c.z_at_n, 0), "ey x ez: z-component should be 0"
+
+        c = self.cross(ez, ex)
+        assert np.allclose(c.x_at_u, 0), "ez x ex: x-component should be 0"
+        assert np.allclose(c.y_at_v, 1), "ez x ex: y-component should be 1"
+        assert np.allclose(c.z_at_n, 0), "ez x ex: z-component should be 0"
+
+        # antisymmetry: a x b = -(b x a)
+        c1 = self.cross(ex, ey)
+        c2 = self.cross(ey, ex)
+        assert np.allclose(c1.x_at_u, -c2.x_at_u)
+        assert np.allclose(c1.y_at_v, -c2.y_at_v)
+        assert np.allclose(c1.z_at_n, -c2.z_at_n)
+
+        print("Cross product tests pass")
+
     # -- collecting snapshots ----------------------------------------
     def snapshot(self) -> dict:
         """Cell-centered (N, N) snapshot of current state, suitable for SciML datasets."""
@@ -395,14 +486,11 @@ class CavityFlow:
 
 # ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Quick operator sanity check
-    sim_test = CavityFlow(Re=400.0, N=16)
-    sim_test.test_operators()
+    
 
     # Full LDC run for Ghia validation
-    sim = CavityFlow(Re=400.0, N=64, dt=0.001)
+    sim = CavityMHD(Re=100.0, N=64, dt=0.005)
     safe_dt = sim.cfl_dt()
     print(f"Suggested dt for stability: {safe_dt:.5f}")
-    sim.run(t_end=10, steady_tol=1e-3, log_every=200)
-    plot_streamline(sim.u, sim.v, sim.Re, sim.H, sim.N,
-                    folder="./results", save=False)
+
+    sim.test_operators()

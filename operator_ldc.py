@@ -142,7 +142,25 @@ class CavityFlow:
         dt_conv = min(self.dx / u_max, self.dy / v_max)
         dt_diff = 0.5 * min(self.dx, self.dy)**2 * self.Re
         return safety * min(dt_conv, dt_diff)
+    
+    # ── interior interpolations (used by convective term) ───────────
 
+    def _u_to_c(self, u):
+        N = self.N
+        return 0.5 * (u[1:N+1, 0:N] + u[1:N+1, 1:N+1])
+
+    def _v_to_c(self, v):
+        N = self.N
+        return 0.5 * (v[0:N, 1:N+1] + v[1:N+1, 1:N+1])
+
+    def _u_to_n(self, u):
+        N = self.N
+        return 0.5 * (u[0:N+1, :] + u[1:N+2, :])
+
+    def _v_to_n(self, v):
+        N = self.N
+        return 0.5 * (v[:, 0:N+1] + v[:, 1:N+2])
+        
     # ── operators ───────────────────────────────────────────────────
 
     def grad(self, field: CellScalar) -> FaceVector:
@@ -201,42 +219,9 @@ class CavityFlow:
         p[:, 0]  = p[:, 1];   p[:, -1] = p[:, -2]
         p[0, :]  = p[1, :];   p[-1, :] = p[-2, :]
 
-    # ── interior interpolations (used by convective term) ───────────
-
-    def _u_to_c(self, u):
-        N = self.N
-        return 0.5 * (u[1:N+1, 0:N] + u[1:N+1, 1:N+1])
-
-    def _v_to_c(self, v):
-        N = self.N
-        return 0.5 * (v[0:N, 1:N+1] + v[1:N+1, 1:N+1])
-
-    def _u_to_n(self, u):
-        N = self.N
-        return 0.5 * (u[0:N+1, :] + u[1:N+2, :])
-
-    def _v_to_n(self, v):
-        N = self.N
-        return 0.5 * (v[:, 0:N+1] + v[:, 1:N+2])
-
-    # ── divergence and pressure gradients used by projection ────────
-
-    def _div_uv_to_c(self, u, v):
-        """Discrete divergence at interior cells. Used by project()."""
-        N = self.N
-        div_x = (u[1:N+1, 1:N+1] - u[1:N+1, 0:N]) / self.dx
-        div_y = (v[0:N, 1:N+1] - v[1:N+1, 1:N+1]) / self.dy
-        return div_x + div_y
-
-    def _grad_x_p_to_u(self, p):
-        N = self.N
-        return (p[1:N+1, 2:N+1] - p[1:N+1, 1:N]) / self.dx
-
-    def _grad_y_p_to_v(self, p):
-        N = self.N
-        return (p[1:N, 1:N+1] - p[2:N+1, 1:N+1]) / self.dy
 
     # ── physics: RHS of momentum (convective + viscous) ─────────────
+
 
     def compute_H(self, velocity: FaceVector) -> FaceVector:
         """RHS of momentum at interior faces.
@@ -272,6 +257,10 @@ class CavityFlow:
         """Bundle u, v into a FaceVector for operator use."""
         return FaceVector(x_at_u=self.u, y_at_v=self.v)
 
+    def pressure(self) -> CellScalar:
+        """Bundle p into a CellScalar for operator use."""
+        return CellScalar(data=self.p)
+
     # ── pressure projection ─────────────────────────────────────────
 
     def solve_pressure(self, source, alpha=1.7, tol=1e-7,
@@ -290,10 +279,10 @@ class CavityFlow:
 
     def project(self, dt):
         N = self.N
-        source = self._div_uv_to_c(self.u, self.v) / dt
+        source = self.div(self.velocity()).data / dt
         self.solve_pressure(source)
-        self.u[1:N+1, 1:N]   -= dt * self._grad_x_p_to_u(self.p)
-        self.v[1:N,   1:N+1] -= dt * self._grad_y_p_to_v(self.p)
+        self.u[1:N+1, 1:N]   -= dt * self.grad(self.pressure()).x_at_u[1:N+1, 1:N]
+        self.v[1:N,   1:N+1] -= dt * self.grad(self.pressure()).y_at_v[1:N, 1:N+1]
 
     # ── time stepping ───────────────────────────────────────────────
 
@@ -337,7 +326,7 @@ class CavityFlow:
                 du, dv = self.u - u_prev, self.v - v_prev
                 rms = np.sqrt((np.sum(du**2) + np.sum(dv**2))
                               / (du.size + dv.size)) / self.dt
-                div = np.max(np.abs(self._div_uv_to_c(self.u, self.v)))
+                div = np.max(np.abs(self.div(self.velocity()).data))
                 print(f"step {self.step_count:6d}  t={self.t:.3f}  "
                       f"rms_dudt={rms:.3e}  max|div|={div:.2e}")
                 if steady_tol is not None and rms < steady_tol:
@@ -395,14 +384,14 @@ class CavityFlow:
 
 # ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Quick operator sanity check
-    sim_test = CavityFlow(Re=400.0, N=16)
-    sim_test.test_operators()
+    
 
     # Full LDC run for Ghia validation
-    sim = CavityFlow(Re=400.0, N=64, dt=0.001)
+    sim = CavityFlow(Re=100.0, N=64, dt=0.005)
     safe_dt = sim.cfl_dt()
     print(f"Suggested dt for stability: {safe_dt:.5f}")
-    sim.run(t_end=10, steady_tol=1e-3, log_every=200)
+
+    sim.test_operators()
+    sim.run(t_end=5, steady_tol=1e-3, log_every=200)
     plot_streamline(sim.u, sim.v, sim.Re, sim.H, sim.N,
                     folder="./results", save=False)
