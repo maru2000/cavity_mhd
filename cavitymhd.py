@@ -102,7 +102,7 @@ class CavityMHD:
 
     # ── construction ────────────────────────────────────────────────
 
-    def __init__(self, Re, N, B=[0, 0, 0], H=1.0, dt=None,
+    def __init__(self, Re, N, B=[1, 0, 0], H=1.0, dt=None,
                  lid_taper=0.01, N_int=0.0):
         self.Re = Re
         self.N = N
@@ -264,7 +264,7 @@ class CavityMHD:
 
     def apply_bcs(self):
         """Walls + ghost cells. u_lid at top; no-slip elsewhere; Neumann p."""
-        u, v, p = self.u, self.v, self.p
+        u, v, p, phi = self.u, self.v, self.p, self.phi
 
         # direct: u on left/right walls
         u[1:-1, 0]  = 0.0
@@ -286,6 +286,10 @@ class CavityMHD:
         p[:, 0]  = p[:, 1];   p[:, -1] = p[:, -2]
         p[0, :]  = p[1, :];   p[-1, :] = p[-2, :]
 
+        # phi Neumann
+        phi[:, 0] = phi[:, 1];  phi[:, -1] = phi[:, -2]
+        phi[0, :] = phi[1, :];  phi[-1, :] = phi[-2, :]
+
 
     # ── physics: RHS of momentum (convective + viscous) ─────────────
 
@@ -294,7 +298,7 @@ class CavityMHD:
         Convective term: conservative form -div(u u). Inlined for now.
         Viscous term: (1/Re) * laplacian(u).
         """
-        N, dx, dy, Re = self.N, self.dx, self.dy, self.Re
+        N, dx, dy, Re, N_int = self.N, self.dx, self.dy, self.Re, self.N_int
         u, v = velocity.x_at_u, velocity.y_at_v
 
         # cell-centered products
@@ -317,17 +321,70 @@ class CavityMHD:
         H_x = H_x_conv + visc.x_at_u / Re
         H_y = H_y_conv + visc.y_at_v / Re
 
+        # Lorentz Computation
+        # Compute cross
+        uxB = self.cross(velocity, self.magneticfield())
+
+        # Pad to full lattices for div
+        uxB_x_full = np.zeros((N+2, N+1))
+        uxB_x_full[1:N+1, 1:N] = uxB.x_at_u
+        uxB_y_full = np.zeros((N+1, N+2))
+        uxB_y_full[1:N, 1:N+1] = uxB.y_at_v
+        uxB_padded = FaceVector(x_at_u=uxB_x_full, y_at_v=uxB_y_full, z_at_n=uxB.z_at_n)
+
+        # Compute potential field
+        self.solve_potential(self.div(uxB_padded).data)
+
+        # Compute j - pad j to have be a full vector. Same shapes for j and B for Lorentz compute
+        gradphi = self.grad(self.potential())
+        j_x_full = np.zeros((N+2, N+1))
+        j_x_full[1:N+1, 1:N] = -gradphi.x_at_u[1:N+1, 1:N] + uxB.x_at_u
+
+        j_y_full = np.zeros((N+1, N+2))
+        j_y_full[1:N, 1:N+1] = -gradphi.y_at_v[1:N, 1:N+1] + uxB.y_at_v
+
+        j = FaceVector(x_at_u=j_x_full, y_at_v=j_y_full, z_at_n=uxB.z_at_n)
+        
+        # Lorentz term
+        Fz = self.cross(j, self.magneticfield())
+
+        #print(f"max |F_x|={np.max(np.abs(Fz.x_at_u)):.3e}, max |F_y|={np.max(np.abs(Fz.y_at_v)):.3e}")
+        H_x += N_int * Fz.x_at_u
+        H_y += N_int * Fz.y_at_v
+
         return FaceVector(x_at_u=H_x, y_at_v=H_y)
 
     def velocity(self) -> FaceVector:
         """Bundle u, v into a FaceVector for operator use."""
-        return FaceVector(x_at_u=self.u, y_at_v=self.v)
+        return FaceVector(x_at_u=self.u, y_at_v=self.v, z_at_n=np.zeros((self.N+1, self.N+1)))
+    
+    def magneticfield(self) -> FaceVector:
+        """Bundle Bx, By, Bz into a FaceVector for operator use."""
+        return FaceVector(x_at_u=self.Bx, y_at_v=self.By, z_at_n=self.Bz)
 
     def pressure(self) -> CellScalar:
         """Bundle p into a CellScalar for operator use."""
         return CellScalar(data=self.p)
+    
+    def potential(self) -> CellScalar:
+        """Bundle phi into a CellScalar for operator use."""
+        return CellScalar(data=self.phi)
 
     # ── pressure projection ─────────────────────────────────────────
+
+    def solve_potential(self, source, alpha=1.7, tol=1e-7,
+                       max_iter=100_000, check_every=10):
+        h, N, phi = self.dx, self.N, self.phi
+        res_max = np.inf
+        for it in range(max_iter):
+            _sor_sweep(phi, source, alpha, h, N)
+            phi[:, 0] = phi[:, 1];  phi[:, -1] = phi[:, -2]
+            phi[0, :] = phi[1, :];  phi[-1, :] = phi[-2, :]
+            if it % check_every == 0:
+                res_max = _poisson_residual_max(phi, source, h, N)
+                if res_max < tol:
+                    return it, res_max
+        return max_iter, res_max
 
     def solve_pressure(self, source, alpha=1.7, tol=1e-7,
                        max_iter=100_000, check_every=10):
@@ -489,8 +546,12 @@ if __name__ == "__main__":
     
 
     # Full LDC run for Ghia validation
-    sim = CavityMHD(Re=100.0, N=64, dt=0.005)
+    sim = CavityMHD(Re=100.0, N=64, dt=0.005, N_int=1.0)
     safe_dt = sim.cfl_dt()
     print(f"Suggested dt for stability: {safe_dt:.5f}")
 
     sim.test_operators()
+
+    sim.run(t_end=5, steady_tol=1e-3, log_every=200)
+    plot_streamline(sim.u, sim.v, sim.Re, sim.H, sim.N,
+                    folder="./results", save=False)
