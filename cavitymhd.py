@@ -546,12 +546,16 @@ if __name__ == "__main__":
     
 
     # Full LDC run for Ghia validation
-    sim = CavityMHD(Re=100.0, N=64, dt=0.005, N_int=1.0)
+    dt = 0.005
+    sim = CavityMHD(Re=5000.0, B=[1,0,0], N=129, dt=dt, N_int=0.4)
     safe_dt = sim.cfl_dt()
     print(f"Suggested dt for stability: {safe_dt:.5f}")
 
+    assert dt < safe_dt,  "Reduce time step below stability limit"
+        
+
     sim.test_operators()
 
-    sim.run(t_end=5, steady_tol=1e-3, log_every=200)
+    sim.run(t_end=30, steady_tol=1e-3, log_every=20)
     plot_streamline(sim.u, sim.v, sim.Re, sim.H, sim.N,
                     folder="./results", save=False)
