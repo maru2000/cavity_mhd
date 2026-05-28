@@ -439,6 +439,8 @@ class CavityMHD:
         self.apply_bcs()
         u_prev = self.u.copy()
         v_prev = self.v.copy()
+        import time
+        t0 = time.perf_counter()
 
         while True:
             if n_steps is not None and self.step_count >= n_steps: break
@@ -450,8 +452,10 @@ class CavityMHD:
                 rms = np.sqrt((np.sum(du**2) + np.sum(dv**2))
                               / (du.size + dv.size)) / self.dt
                 div = np.max(np.abs(self.div(self.velocity()).data))
+                elapsed = time.perf_counter() - t0
                 print(f"step {self.step_count:6d}  t={self.t:.3f}  "
-                      f"rms_dudt={rms:.3e}  max|div|={div:.2e}")
+                      f"rms_dudt={rms:.3e}  max|div|={div:.2e}  "
+                      f"wall={elapsed:.1f}s")
                 if steady_tol is not None and rms < steady_tol:
                     print("Steady state reached.")
                     break
@@ -547,7 +551,7 @@ if __name__ == "__main__":
 
     # Full LDC run for Ghia validation
     dt = 0.005
-    sim = CavityMHD(Re=400.0, B=[1,0,0], N=64, dt=dt, N_int=0.0)
+    sim = CavityMHD(Re=5000.0, B=[1,0,0], N=64, dt=dt, N_int=0.4)
     safe_dt = sim.cfl_dt()
     print(f"Suggested dt for stability: {safe_dt:.5f}")
 
@@ -556,6 +560,6 @@ if __name__ == "__main__":
 
     sim.test_operators()
 
-    sim.run(t_end=5, steady_tol=1e-3, log_every=1)
+    sim.run(t_end=5, steady_tol=1e-3, log_every=100)
     plot_streamline(sim.u, sim.v, sim.Re, sim.H, sim.N,
                     folder="./results", save=False)

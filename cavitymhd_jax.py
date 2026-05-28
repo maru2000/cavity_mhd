@@ -14,7 +14,7 @@ Solver roadmap (swap via params.solver, callers unchanged):
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax.scipy.sparse.linalg import cg
+from jax.scipy.sparse.linalg import cg, bicgstab
 from functools import partial
 from numba import njit
 import matplotlib.pyplot as plt
@@ -122,17 +122,18 @@ def _laplacian_op(p_flat, N, dx):
     p_int  = p_flat.reshape(N, N)
     p_full = jnp.zeros((N+2, N+2)).at[1:-1, 1:-1].set(p_int)
     p_full = _apply_neumann(p_full, N)
-    neg_lap = (4.0 * p_full[1:-1, 1:-1]
-               - p_full[:-2,  1:-1] - p_full[2:,   1:-1]
-               - p_full[1:-1, :-2]  - p_full[1:-1, 2:]) / dx**2
-    return (neg_lap + 1e-8 * p_int).ravel()   # shape (N*N,)
+    lap = (p_full[:-2,  1:-1] + p_full[2:,   1:-1] +
+           p_full[1:-1, :-2]  + p_full[1:-1, 2:] -
+           4.0 * p_full[1:-1, 1:-1]) / dx**2
+    return lap.ravel()
 
-def _poisson_solve_cg(field, source_interior, N, dx, tol=1e-10):
-    A      = partial(_laplacian_op, N=N, dx=dx)
-    sol, info = cg(A, -source_interior.ravel(),
-                x0=field[1:-1, 1:-1].ravel(), tol=tol, maxiter=10*N*N)
-    sol    = sol - jnp.mean(sol)  # Remove null space by removing mean
-    #print("convergence information:", info)
+def _poisson_solve_bicgstab(field, source_interior, N, dx, tol=1e-7):
+    src = source_interior - jnp.mean(source_interior)
+    A   = partial(_laplacian_op, N=N, dx=dx)
+    x0  = field[1:-1, 1:-1].ravel()
+    x0  = x0 - jnp.mean(x0)
+    sol, _ = bicgstab(A, -src.ravel(), x0=x0, tol=tol, maxiter=10*N*N)
+    sol    = sol - jnp.mean(sol)
     p_full = jnp.zeros((N+2, N+2)).at[1:-1, 1:-1].set(sol.reshape(N, N))
     return _apply_neumann(p_full, N)
 
@@ -149,14 +150,39 @@ def _poisson_solve_sor(field, source_interior, N, dx,
                 break
     return jnp.array(p)
 
+def _poisson_solve_jacobi(field, source_interior, N, dx, tol=1e-6, max_iter=50_000):
+    # embed source into full grid
+    rhs = jnp.zeros((N+2, N+2)).at[1:-1, 1:-1].set(source_interior)
+
+    def body(carry):
+        p, _ = carry
+        p = _apply_neumann(p, N)
+        p_new = (p[:-2, 1:-1] + p[2:, 1:-1] +
+                 p[1:-1, :-2] + p[1:-1, 2:] -
+                 dx**2 * rhs[1:-1, 1:-1]) / 4.0
+        p_new = p_new - jnp.mean(p_new)
+        p_full = jnp.zeros((N+2, N+2)).at[1:-1, 1:-1].set(p_new)
+        res = jnp.max(jnp.abs(p_full[1:-1, 1:-1] - p[1:-1, 1:-1]))
+        return p_full, res
+
+    def cond(carry):
+        _, res = carry
+        return res > tol
+
+    p_init = field - jnp.mean(field)
+    p_out, _ = jax.lax.while_loop(cond, body, (p_init, jnp.inf))
+    return _apply_neumann(p_out, N)
+
 def _poisson_solve(field, source_interior, params):
     """Single dispatch point. Swap solver via params.solver."""
-    if params.solver == 'cg':
-        return _poisson_solve_cg(field, source_interior, params.N, params.dx)
+    if params.solver == 'bicgstab':
+        return _poisson_solve_bicgstab(field, source_interior, params.N, params.dx)
     elif params.solver == 'sor':
         return _poisson_solve_sor(field, source_interior, params.N, params.dx)
+    elif params.solver == 'jacobi':
+        return _poisson_solve_jacobi(field, source_interior, params.N, params.dx)
     else:
-        raise ValueError(f"Unknown solver '{params.solver}'. Choose 'cg' or 'sor'.")
+        raise ValueError(f"Unknown solver '{params.solver}'. Choose 'bicgstab' or 'sor' or 'jacobi'.")
 
 # ────────────────────────────────────────────────────────────────────
 # Boundary conditions
@@ -391,8 +417,8 @@ def plot_streamline(params: Params, state: State, folder=None, save=False):
 
 # ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    dt = 0.001
-    params, state = init(Re=400.0, N=64, B=[1, 0, 0], dt=dt, N_int=0.0, solver='cg')
+    dt = 0.05
+    params, state = init(Re=5000.0, N=64, B=[1, 0, 0], dt=dt, N_int=0.4, solver='jacobi')
 
     safe = cfl_dt(state, params)
     print(f"Suggested CFL dt: {safe:.5f}")
@@ -401,7 +427,7 @@ if __name__ == "__main__":
     import time
 
     start = time.time()
-    state = run(params, state, t_end=5.0, steady_tol=1e-3, log_every=1)
+    state = run(params, state, t_end=5, steady_tol=1e-3, log_every=100)
     plot_streamline(params, state)
     end = time.time()
 
