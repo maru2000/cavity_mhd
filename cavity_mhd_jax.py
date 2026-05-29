@@ -150,7 +150,7 @@ def _poisson_solve_sor(field, source_interior, N, dx,
                 break
     return jnp.array(p)
 
-def _poisson_solve_jacobi(field, source_interior, N, dx, tol=1e-6, max_iter=50_000):
+def _poisson_solve_jacobi(field, source_interior, N, dx, tol=1e-7, max_iter=50_000, remove_mean=True):
     # embed source into full grid
     rhs = jnp.zeros((N+2, N+2)).at[1:-1, 1:-1].set(source_interior)
 
@@ -160,7 +160,8 @@ def _poisson_solve_jacobi(field, source_interior, N, dx, tol=1e-6, max_iter=50_0
         p_new = (p[:-2, 1:-1] + p[2:, 1:-1] +
                  p[1:-1, :-2] + p[1:-1, 2:] -
                  dx**2 * rhs[1:-1, 1:-1]) / 4.0
-        p_new = p_new - jnp.mean(p_new)
+        if remove_mean:
+            p_new = p_new - jnp.mean(p_new)
         p_full = jnp.zeros((N+2, N+2)).at[1:-1, 1:-1].set(p_new)
         res = jnp.max(jnp.abs(p_full[1:-1, 1:-1] - p[1:-1, 1:-1]))
         return p_full, res
@@ -173,14 +174,14 @@ def _poisson_solve_jacobi(field, source_interior, N, dx, tol=1e-6, max_iter=50_0
     p_out, _ = jax.lax.while_loop(cond, body, (p_init, jnp.inf))
     return _apply_neumann(p_out, N)
 
-def _poisson_solve(field, source_interior, params):
+def _poisson_solve(field, source_interior, params, remove_mean=True):
     """Single dispatch point. Swap solver via params.solver."""
     if params.solver == 'bicgstab':
         return _poisson_solve_bicgstab(field, source_interior, params.N, params.dx)
     elif params.solver == 'sor':
         return _poisson_solve_sor(field, source_interior, params.N, params.dx)
     elif params.solver == 'jacobi':
-        return _poisson_solve_jacobi(field, source_interior, params.N, params.dx)
+        return _poisson_solve_jacobi(field, source_interior, params.N, params.dx, remove_mean=remove_mean)
     else:
         raise ValueError(f"Unknown solver '{params.solver}'. Choose 'bicgstab' or 'sor' or 'jacobi'.")
 
@@ -271,7 +272,7 @@ def project(state: State, params: Params) -> State:
 # Momentum RHS
 # ────────────────────────────────────────────────────────────────────
 
-def compute_H(state: State, params: Params):
+def compute_H(state: State, params: Params, print_debug=True):
     u, v = state.u, state.v
     N, dx, dy  = params.N, params.dx, params.dy
     Re, N_int  = params.Re, params.N_int
@@ -282,30 +283,48 @@ def compute_H(state: State, params: Params):
     vv_c = _v_to_c(v, N) ** 2
     uv_n = _u_to_n(u, N) * _v_to_n(v, N)
 
-    H_x = -((uu_c[:, 1:] - uu_c[:, :-1]) / dx +
-             (uv_n[0:N, 1:N] - uv_n[1:N+1, 1:N]) / dy)
-    H_y = -((uv_n[1:N, 1:N+1] - uv_n[1:N, 0:N]) / dx +
-             (vv_c[0:N-1, :] - vv_c[1:N, :]) / dy)
+    # convective contributions (conservative form: -div(uu))
+    duudx = (uu_c[:, 1:]      - uu_c[:, :-1])      / dx     # (N, N-1)
+    duvdy = (uv_n[0:N, 1:N]   - uv_n[1:N+1, 1:N])  / dy     # (N, N-1)
+    H_x = -(duudx + duvdy)
+
+    duvdx = (uv_n[1:N, 1:N+1] - uv_n[1:N, 0:N])    / dx     # (N-1, N)
+    dvvdy = (vv_c[0:N-1, :]   - vv_c[1:N, :])      / dy     # (N-1, N)
+    H_y = -(duvdx + dvvdy)
 
     lap_x, lap_y = laplacian(u, v, params)
-    H_x = H_x + lap_x / Re
-    H_y = H_y + lap_y / Re
+    H_x += lap_x / Re
+    H_y += lap_y / Re
 
+    # u x B (all three components on their natural staggered grids)
     uxB_x, uxB_y, uxB_z = cross(u, v, uz, Bx, By, Bz, N)
+
+    # Poisson for phi: ∇²φ = ∇·(u x B)_inplane
     uxB_x_full = jnp.zeros((N+2, N+1)).at[1:N+1, 1:N  ].set(uxB_x)
     uxB_y_full = jnp.zeros((N+1, N+2)).at[1:N,   1:N+1].set(uxB_y)
-
     lorentz_src = div(uxB_x_full, uxB_y_full, params)
-    phi_new     = _poisson_solve(state.phi, lorentz_src, params)
+    phi_new     = _poisson_solve(state.phi, lorentz_src, params, remove_mean=False)
     state       = state._replace(phi=phi_new)
 
+    # Currents: j = -∇φ + u x B  (all three components)
     gp_x, gp_y = grad(state.phi, params)
     j_x = jnp.zeros((N+2, N+1)).at[1:N+1, 1:N  ].set(-gp_x[1:N+1, 1:N]   + uxB_x)
     j_y = jnp.zeros((N+1, N+2)).at[1:N,   1:N+1].set(-gp_y[1:N,   1:N+1] + uxB_y)
+    # j_z lives on the cell-center (N+1 x N+1) node grid
+    j_z = jnp.zeros((N+1, N+1)).at[1:N, 1:N].set(uxB_z[1:N, 1:N])  # φ has no z-variation in 2D
 
-    F_x, F_y, _ = cross(j_x, j_y, uxB_z, Bx, By, Bz, N)
+    # Lorentz force: F = j x B  — pass j_z correctly
+    F_x, F_y, _ = cross(j_x, j_y, j_z, Bx, By, Bz, N)
     H_x = H_x + N_int * F_x
     H_y = H_y + N_int * F_y
+
+    if print_debug:
+        # Debug block
+        print(f"  uxB   max: {jnp.max(jnp.abs(uxB_x)):.3e}, {jnp.max(jnp.abs(uxB_y)):.3e}, {jnp.max(jnp.abs(uxB_z)):.3e}")
+        print(f"  phi   max: {jnp.max(jnp.abs(state.phi)):.3e}")
+        print(f"  j     max: {jnp.max(jnp.abs(j_x)):.3e}, {jnp.max(jnp.abs(j_y)):.3e}, {jnp.max(jnp.abs(j_z)):.3e}")
+        print(f"  F     max: {jnp.max(jnp.abs(F_x)):.3e}, {jnp.max(jnp.abs(F_y)):.3e}")
+        print(f"  H_x/H_y max (post-Lorentz): {jnp.max(jnp.abs(H_x)):.3e}, {jnp.max(jnp.abs(H_y)):.3e}")
 
     return H_x, H_y, state
 
@@ -317,7 +336,7 @@ def step(state: State, params: Params) -> State:
     N, dt = params.N, params.dt
     u0, v0 = state.u, state.v
 
-    H_x, H_y, state = compute_H(state, params)
+    H_x, H_y, state = compute_H(state, params, print_debug=False)
     state = state._replace(
         u=u0.at[1:N+1, 1:N  ].set(u0[1:N+1, 1:N]   + dt * H_x),
         v=v0.at[1:N,   1:N+1].set(v0[1:N,   1:N+1] + dt * H_y),
@@ -326,7 +345,7 @@ def step(state: State, params: Params) -> State:
     state = project(state, params)
     state = apply_bcs(state, params)
 
-    H_x, H_y, state = compute_H(state, params)
+    H_x, H_y, state = compute_H(state, params, print_debug=False)
     state = state._replace(
         u=u0.at[1:N+1, 1:N  ].set(0.5*(u0[1:N+1, 1:N]   + state.u[1:N+1, 1:N])   + 0.5*dt*H_x),
         v=v0.at[1:N,   1:N+1].set(0.5*(v0[1:N,   1:N+1] + state.v[1:N,   1:N+1]) + 0.5*dt*H_y),
@@ -341,9 +360,9 @@ def step(state: State, params: Params) -> State:
 # CFL utility
 # ────────────────────────────────────────────────────────────────────
 
-def cfl_dt(state: State, params: Params, safety=0.8) -> float:
-    u_max   = float(jnp.max(jnp.abs(state.u))) + 1e-12
-    v_max   = float(jnp.max(jnp.abs(state.v))) + 1e-12
+def cfl_dt(state, params, safety=0.5):
+    u_max = max(float(jnp.max(jnp.abs(state.u))), 1.0)  # floor at lid velocity
+    v_max = max(float(jnp.max(jnp.abs(state.v))), 1e-12)
     dt_conv = min(params.dx / u_max, params.dy / v_max)
     dt_diff = 0.5 * min(params.dx, params.dy)**2 * params.Re
     return safety * min(dt_conv, dt_diff)
@@ -417,7 +436,7 @@ def plot_streamline(params: Params, state: State, folder=None, save=False):
 
 # ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    dt = 0.05
+    dt = 0.005
     params, state = init(Re=5000.0, N=64, B=[1, 0, 0], dt=dt, N_int=0.4, solver='jacobi')
 
     safe = cfl_dt(state, params)
@@ -427,7 +446,7 @@ if __name__ == "__main__":
     import time
 
     start = time.time()
-    state = run(params, state, t_end=5, steady_tol=1e-3, log_every=100)
+    state = run(params, state, t_end=50, steady_tol=1e-3, log_every=100)
     plot_streamline(params, state)
     end = time.time()
 

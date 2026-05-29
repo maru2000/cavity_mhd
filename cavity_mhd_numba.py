@@ -136,9 +136,9 @@ class CavityMHD:
         right = 0.5 * (1 - np.tanh((xn - (1 - w)) / (w / 3)))
         return coeff * left * right
 
-    def cfl_dt(self, safety=0.8):
-        u_max = max(np.max(np.abs(self.u)), 1e-12)
-        v_max = max(np.max(np.abs(self.v)), 1e-12)
+    def cfl_dt(self, safety=0.5):
+        u_max = max(np.max(np.abs(self.u)), 1.0)
+        v_max = max(np.max(np.abs(self.v)), 1.0)
         dt_conv = min(self.dx / u_max, self.dy / v_max)
         dt_diff = 0.5 * min(self.dx, self.dy)**2 * self.Re
         return safety * min(dt_conv, dt_diff)
@@ -293,7 +293,7 @@ class CavityMHD:
 
     # ── physics: RHS of momentum (convective + viscous) ─────────────
 
-    def compute_H(self, velocity: FaceVector) -> FaceVector:
+    def compute_H(self, velocity: FaceVector, print_debug=True) -> FaceVector:
         """RHS of momentum at interior faces.
         Convective term: conservative form -div(u u). Inlined for now.
         Viscous term: (1/Re) * laplacian(u).
@@ -325,6 +325,7 @@ class CavityMHD:
         # Compute cross
         uxB = self.cross(velocity, self.magneticfield())
 
+
         # Pad to full lattices for div
         uxB_x_full = np.zeros((N+2, N+1))
         uxB_x_full[1:N+1, 1:N] = uxB.x_at_u
@@ -351,6 +352,16 @@ class CavityMHD:
         #print(f"max |F_x|={np.max(np.abs(Fz.x_at_u)):.3e}, max |F_y|={np.max(np.abs(Fz.y_at_v)):.3e}")
         H_x += N_int * Fz.x_at_u
         H_y += N_int * Fz.y_at_v
+
+        if print_debug:
+            
+            print(f"  uxB   max: {np.max(np.abs(uxB.x_at_u)):.3e}, "
+                f"{np.max(np.abs(uxB.y_at_v)):.3e}, "
+                f"{np.max(np.abs(uxB.z_at_n)):.3e}")
+            print(f"  lorentz_src max: {np.max(np.abs(self.div(uxB_padded).data)):.3e}")
+            print(f"  phi   max: {np.max(np.abs(self.phi)):.3e}")
+            print(f"  F     max: {np.max(np.abs(Fz.x_at_u)):.3e}, "
+                f"{np.max(np.abs(Fz.y_at_v)):.3e}")
 
         return FaceVector(x_at_u=H_x, y_at_v=H_y)
 
@@ -415,7 +426,7 @@ class CavityMHD:
         v_n = self.v.copy()
 
         # stage 1
-        H = self.compute_H(self.velocity())
+        H = self.compute_H(self.velocity(), print_debug=False)
         self.u[1:N+1, 1:N]   = u_n[1:N+1, 1:N]   + dt * H.x_at_u
         self.v[1:N,   1:N+1] = v_n[1:N,   1:N+1] + dt * H.y_at_v
         self.apply_bcs()
@@ -423,7 +434,7 @@ class CavityMHD:
         self.apply_bcs()
 
         # stage 2
-        H = self.compute_H(self.velocity())
+        H = self.compute_H(self.velocity(), print_debug=False)
         self.u[1:N+1, 1:N]   = 0.5 * (u_n[1:N+1, 1:N]   + self.u[1:N+1, 1:N])   + 0.5 * dt * H.x_at_u
         self.v[1:N,   1:N+1] = 0.5 * (v_n[1:N,   1:N+1] + self.v[1:N,   1:N+1]) + 0.5 * dt * H.y_at_v
         self.apply_bcs()
@@ -560,6 +571,6 @@ if __name__ == "__main__":
 
     sim.test_operators()
 
-    sim.run(t_end=5, steady_tol=1e-3, log_every=100)
+    sim.run(t_end=50, steady_tol=1e-3, log_every=100)
     plot_streamline(sim.u, sim.v, sim.Re, sim.H, sim.N,
                     folder="./results", save=False)
