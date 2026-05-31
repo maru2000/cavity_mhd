@@ -150,6 +150,22 @@ def _poisson_solve_sor(field, source_interior, N, dx,
                 break
     return jnp.array(p)
 
+def _poisson_solve_spectral(field, source_interior, N, dx, remove_mean=True):
+    
+    src = source_interior - jnp.mean(source_interior) if remove_mean else source_interior
+    
+    i = jnp.arange(N)
+    lam = 2 * (jnp.cos(jnp.pi * i / N) - 1) / dx**2
+    LAM = lam[:, None] + lam[None, :]
+    
+    src_hat = jax.scipy.fft.dctn(src, type=2, norm='ortho')  # or jax version
+    sol_hat = src_hat / LAM
+    sol_hat = sol_hat.at[0, 0].set(0.0)
+    sol = jax.scipy.fft.idctn(sol_hat, type=2, norm='ortho')
+    
+    p_full = jnp.zeros((N+2, N+2)).at[1:-1, 1:-1].set(sol)
+    return _apply_neumann(p_full, N)
+
 def _poisson_solve_jacobi(field, source_interior, N, dx, tol=1e-7, max_iter=50_000, remove_mean=True):
     # embed source into full grid
     rhs = jnp.zeros((N+2, N+2)).at[1:-1, 1:-1].set(source_interior)
@@ -182,6 +198,8 @@ def _poisson_solve(field, source_interior, params, remove_mean=True):
         return _poisson_solve_sor(field, source_interior, params.N, params.dx)
     elif params.solver == 'jacobi':
         return _poisson_solve_jacobi(field, source_interior, params.N, params.dx, remove_mean=remove_mean)
+    elif params.solver == 'spectral':
+        return _poisson_solve_spectral(field, source_interior, params.N, params.dx, remove_mean=remove_mean)
     else:
         raise ValueError(f"Unknown solver '{params.solver}'. Choose 'bicgstab' or 'sor' or 'jacobi'.")
 
@@ -437,7 +455,7 @@ def plot_streamline(params: Params, state: State, folder=None, save=False):
 # ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     dt = 0.005
-    params, state = init(Re=5000.0, N=64, B=[1, 0, 0], dt=dt, N_int=0.4, solver='jacobi')
+    params, state = init(Re=5000.0, N=64, B=[1, 0, 0], dt=dt, N_int=0.4, solver='spectral')
 
     safe = cfl_dt(state, params)
     print(f"Suggested CFL dt: {safe:.5f}")
